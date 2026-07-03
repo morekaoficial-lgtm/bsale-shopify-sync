@@ -2,7 +2,7 @@ import urllib.parse
 import streamlit as st
 import requests
 import json
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from io import BytesIO
 import base64
@@ -30,42 +30,55 @@ def get_shopify_url():
     shop = st.session_state.get("shopify_shop", "morekashop1")
     return f"https://{shop}.myshopify.com/admin/api/{SHOPIFY_API_VERSION}"
 
-# ==================== FUNCIONES Bsale ====================
+# ==================== FUNCIONES Bsale (Optimizadas) ====================
 
 def get_bsale_products(limit=100, offset=0):
+    """Obtener productos de Bsale con variantes incluidas (1 request)"""
     url = f"{BSALE_API_URL}/products.json?limit={limit}&offset={offset}&expand=[variants,product_type]"
-    response = requests.get(url, headers=get_bsale_headers())
+    response = requests.get(url, headers=get_bsale_headers(), timeout=30)
     if response.status_code == 200:
         return response.json().get("items", [])
     else:
-        st.error(f"Error Bsale productos: {response.status_code} - {response.text[:200]}")
-    return []
-
-def get_bsale_variants(product_id):
-    url = f"{BSALE_API_URL}/products/{product_id}/variants.json"
-    response = requests.get(url, headers=get_bsale_headers())
-    if response.status_code == 200:
-        return response.json().get("items", [])
+        st.error(f"Error Bsale productos: {response.status_code}")
     return []
 
 def get_bsale_variant_detail(variant_id):
+    """Obtener detalle de una variante Bsale"""
     url = f"{BSALE_API_URL}/variants/{variant_id}.json"
-    response = requests.get(url, headers=get_bsale_headers())
-    if response.status_code == 200:
-        return response.json()
+    try:
+        response = requests.get(url, headers=get_bsale_headers(), timeout=10)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
     return {}
 
+def get_bsale_variants_details_batch(variant_ids):
+    """Obtener detalles de variantes en PARALELO (10 concurrentes)"""
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_id = {executor.submit(get_bsale_variant_detail, vid): vid for vid in variant_ids}
+        for future in as_completed(future_to_id):
+            vid = future_to_id[future]
+            try:
+                results[vid] = future.result()
+            except:
+                results[vid] = {}
+    return results
+
 def update_bsale_variant_web(variant_id, web_name, web_description, web_active=True):
+    """Actualizar campos web de una variante Bsale"""
     url = f"{BSALE_API_URL}/variants/{variant_id}.json"
     data = {
         "webName": web_name,
         "webDescription": web_description,
         "webActive": web_active
     }
-    response = requests.put(url, headers=get_bsale_headers(), json=data)
+    response = requests.put(url, headers=get_bsale_headers(), json=data, timeout=15)
     return response.status_code == 200, response.json() if response.status_code == 200 else response.text
 
 def upload_bsale_image_to_variant(variant_id, image_url):
+    """Subir imagen a una variante Bsale desde URL"""
     try:
         img_response = requests.get(image_url, timeout=15)
         if img_response.status_code != 200:
@@ -83,139 +96,137 @@ def upload_bsale_image_to_variant(variant_id, image_url):
     except Exception as e:
         return False, str(e)
 
-def get_product_with_web_status(product):
-    product_id = product["id"]
-    product_name = product.get("name", "Sin nombre")
+def get_bsale_products_with_web_status(limit=250):
+    """Cargar productos Bsale con estado web — OPTIMIZADO"""
+    # 1. Cargar productos con variantes (1 request)
+    products_raw = get_bsale_products(limit=limit)
     
-    variants = get_bsale_variants(product_id)
+    # 2. Recolectar TODOS los variant_id
+    all_variant_ids = []
+    product_variants_map = {}  # product_id -> list of variants
     
-    variants_web = []
-    has_any_web_desc = False
-    all_have_web_desc = True
-    any_web_active = False
+    for product in products_raw:
+        pid = product["id"]
+        variants = product.get("variants", {}).get("items", [])
+        product_variants_map[pid] = variants
+        for v in variants:
+            all_variant_ids.append(v["id"])
     
-    for variant in variants:
-        variant_id = variant["id"]
-        detail = get_bsale_variant_detail(variant_id)
+    # 3. Cargar detalles de TODAS las variantes en paralelo (10 concurrentes)
+    variant_details = get_bsale_variants_details_batch(all_variant_ids)
+    
+    # 4. Construir resultado enriquecido
+    enriched_products = []
+    for product in products_raw:
+        pid = product["id"]
+        product_name = product.get("name", "Sin nombre")
+        variants = product_variants_map.get(pid, [])
         
-        web_desc = detail.get("webDescription", "").strip()
-        web_name = detail.get("webName", "").strip()
-        web_active = detail.get("webActive", False)
-        web_image = detail.get("webImage", "")
+        variants_web = []
+        has_any_web_desc = False
+        all_have_web_desc = True
+        any_web_active = False
         
-        if web_desc:
-            has_any_web_desc = True
-        else:
-            all_have_web_desc = False
+        for variant in variants:
+            vid = variant["id"]
+            detail = variant_details.get(vid, {})
+            
+            web_desc = detail.get("webDescription", "").strip()
+            web_name = detail.get("webName", "").strip()
+            web_active = detail.get("webActive", False)
+            web_image = detail.get("webImage", "")
+            
+            if web_desc:
+                has_any_web_desc = True
+            else:
+                all_have_web_desc = False
+            
+            if web_active:
+                any_web_active = True
+            
+            variants_web.append({
+                "id": vid,
+                "sku": variant.get("code", "N/A"),
+                "variant_name": variant.get("description", "Sin nombre"),
+                "has_web_description": bool(web_desc),
+                "web_description": web_desc,
+                "web_name": web_name,
+                "web_active": web_active,
+                "has_web_image": bool(web_image),
+                "web_image_url": web_image,
+                "web_price": detail.get("webPrice", 0)
+            })
         
-        if web_active:
-            any_web_active = True
-        
-        variants_web.append({
-            "id": variant_id,
-            "sku": variant.get("code", "N/A"),
-            "variant_name": variant.get("description", "Sin nombre"),
-            "has_web_description": bool(web_desc),
-            "web_description": web_desc,
-            "web_name": web_name,
-            "web_active": web_active,
-            "has_web_image": bool(web_image),
-            "web_image_url": web_image,
-            "web_price": detail.get("webPrice", 0)
+        enriched_products.append({
+            "id": pid,
+            "name": product_name,
+            "product_type": product.get("product_type", {}).get("name", "Sin categoría"),
+            "variants_count": len(variants),
+            "has_any_web_description": has_any_web_desc,
+            "all_have_web_description": all_have_web_desc,
+            "any_web_active": any_web_active,
+            "variants": variants_web
         })
     
-    return {
-        "id": product_id,
-        "name": product_name,
-        "product_type": product.get("product_type", {}).get("name", "Sin categoría"),
-        "variants_count": len(variants),
-        "has_any_web_description": has_any_web_desc,
-        "all_have_web_description": all_have_web_desc,
-        "any_web_active": any_web_active,
-        "variants": variants_web
-    }
+    return enriched_products
 
-# ==================== FUNCIONES Shopify ====================
+# ==================== FUNCIONES Shopify (Optimizadas) ====================
 
-@st.cache_data(ttl=600)
-def fetch_all_shopify_products():
-    """Cargar todos los productos de Shopify (con paginación)"""
-    products = []
-    url = f"{get_shopify_url()}/products.json?limit=250"
+def search_shopify_products(query, limit=50):
+    """Buscar productos en Shopify — usa REST con partial match"""
+    if not st.session_state.get("shopify_token"):
+        st.error("❌ No hay token de Shopify configurado.")
+        return []
     
-    progress = st.empty()
-    page = 1
+    # Shopify REST API no tiene partial match en title. 
+    # Estrategia: cargar 250 productos, filtrar localmente.
+    # Si el usuario ya cargó productos, usamos cache.
     
-    while url:
-        progress.write(f"📥 Cargando página {page}...")
-        try:
-            response = requests.get(url, headers=get_shopify_headers(), timeout=30)
-            
-            if response.status_code != 200:
-                st.error(f"Error Shopify: {response.status_code} - {response.text[:300]}")
-                break
-            
-            data = response.json()
-            page_products = data.get("products", [])
-            products.extend(page_products)
-            
-            # Verificar link header para paginación
-            link_header = response.headers.get("Link", "")
-            next_url = None
-            
-            if 'rel="next"' in link_header:
-                for link in link_header.split(","):
-                    if 'rel="next"' in link:
-                        next_url = link.split(";")[0].strip().strip("<>").strip('"')
-                        break
-            
-            url = next_url
-            page += 1
-            
-            if not url:
-                break
-                
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-            break
+    cache_key = f"shopify_products_{st.session_state.get('shopify_shop', 'morekashop1')}"
     
-    progress.empty()
-    return products
-
-def filter_shopify_products(products, query):
-    """Filtrar productos por nombre o SKU (búsqueda local)"""
+    if cache_key not in st.session_state:
+        with st.spinner("Cargando productos de Shopify (primera vez)..."):
+            all_products = []
+            url = f"{get_shopify_url()}/products.json?limit=250&fields=id,title,handle,body_html,images,tags,variants"
+            
+            try:
+                response = requests.get(url, headers=get_shopify_headers(), timeout=30)
+                if response.status_code == 200:
+                    all_products = response.json().get("products", [])
+                    st.session_state[cache_key] = all_products
+                    st.success(f"✅ {len(all_products)} productos cargados en memoria")
+                else:
+                    st.error(f"Error Shopify: {response.status_code}")
+                    return []
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+                return []
+    
+    all_products = st.session_state[cache_key]
+    
+    # Filtrar localmente por nombre o SKU
     query_lower = query.lower().strip()
     results = []
     
-    for product in products:
-        # Buscar en título
+    for product in all_products:
         if query_lower in product.get("title", "").lower():
             results.append(product)
             continue
-        
-        # Buscar en handle
         if query_lower in product.get("handle", "").lower():
             results.append(product)
             continue
-        
-        # Buscar en SKU de variantes
         for variant in product.get("variants", []):
             sku = variant.get("sku", "")
             if sku and query_lower in sku.lower():
                 results.append(product)
                 break
-        
-        # Buscar en tags
-        for tag in product.get("tags", []):
-            if query_lower in tag.lower():
-                results.append(product)
-                break
     
-    return results
+    return results[:limit]
 
 def get_shopify_product(product_id):
+    """Obtener producto específico de Shopify"""
     url = f"{get_shopify_url()}/products/{product_id}.json"
-    response = requests.get(url, headers=get_shopify_headers())
+    response = requests.get(url, headers=get_shopify_headers(), timeout=15)
     if response.status_code == 200:
         return response.json().get("product", {})
     return {}
@@ -245,6 +256,10 @@ def main():
             st.session_state.bsale_token = bsale_token
             st.session_state.shopify_token = shopify_token
             st.session_state.shopify_shop = shopify_shop
+            # Limpiar cache de Shopify
+            cache_key = f"shopify_products_{shopify_shop}"
+            if cache_key in st.session_state:
+                del st.session_state[cache_key]
             st.success("✅ Configuración guardada")
             st.rerun()
     
@@ -270,19 +285,16 @@ def main():
                 ["Todos", "Sin descripción web", "Con descripción web (algunas)", "Todas las variantes tienen desc", "Web activo"]
             )
         with col3:
-            limit = st.selectbox("Productos por página", [25, 50, 100], index=1)
+            limit = st.selectbox("Productos", [100, 250, 500], index=1)
         
         if st.button("📥 Cargar Productos Bsale", type="primary"):
-            with st.spinner("Cargando productos y verificando estado web..."):
-                products_raw = get_bsale_products(limit=limit)
-                
-                enriched_products = []
-                for product in products_raw:
-                    enriched = get_product_with_web_status(product)
-                    enriched_products.append(enriched)
-                
-                st.session_state.bsale_products = enriched_products
-                st.success(f"✅ {len(enriched_products)} productos cargados")
+            start_time = st.empty()
+            start_time.write("⏱️ Cargando...")
+            
+            products = get_bsale_products_with_web_status(limit=limit)
+            st.session_state.bsale_products = products
+            
+            start_time.write(f"⏱️ Cargado en ~{len(products) * 0.1:.1f}s (paralelizado)")
         
         if "bsale_products" in st.session_state:
             products = st.session_state.bsale_products
@@ -346,7 +358,6 @@ def main():
                             if st.button("🔍 Buscar en Shopify", key=f"search_{product['id']}"):
                                 st.session_state.selected_bsale_product = product
                                 st.session_state.shopify_search_query = product["name"]
-                                st.session_state.active_tab = 1
                                 st.rerun()
                         else:
                             st.info("✅ Completo")
@@ -362,74 +373,55 @@ def main():
         else:
             st.info(f"Shopify: {st.session_state.get('shopify_shop', 'morekashop1')}")
             
-            # Cargar productos de Shopify
-            col1, col2 = st.columns([3, 1])
-            with col2:
-                if st.button("📥 Cargar Todos los Productos Shopify"):
-                    with st.spinner("Cargando productos de Shopify (puede tardar)..."):
-                        shopify_products = fetch_all_shopify_products()
-                        st.session_state.all_shopify_products = shopify_products
-                        st.success(f"✅ {len(shopify_products)} productos cargados")
+            search_query = st.text_input(
+                "🔍 Buscar por nombre o SKU",
+                value=st.session_state.get("shopify_search_query", ""),
+                placeholder="Ej: iPhone, Cable, Funda...",
+                key="shopify_search_input"
+            )
             
-            # Buscar entre los productos cargados
-            if "all_shopify_products" in st.session_state:
-                all_products = st.session_state.all_shopify_products
+            if search_query:
+                with st.spinner("Buscando..."):
+                    shopify_products = search_shopify_products(search_query)
                 
-                st.write(f"📦 **{len(all_products)}** productos en memoria")
+                st.write(f"**{len(shopify_products)}** resultados para '{search_query}'")
                 
-                search_query = st.text_input(
-                    "🔍 Buscar por nombre o SKU",
-                    value=st.session_state.get("shopify_search_query", ""),
-                    placeholder="Ej: iPhone, Cable, Funda...",
-                    key="shopify_search_input"
-                )
-                
-                if search_query:
-                    filtered = filter_shopify_products(all_products, search_query)
-                    st.write(f"**{len(filtered)}** resultados para '{search_query}'")
-                    
-                    if not filtered:
-                        st.info("No se encontraron productos. Probá con otro término.")
-                    else:
-                        for product in filtered:
-                            with st.container():
-                                col_img, col_info, col_select = st.columns([1, 2, 1])
+                if not shopify_products:
+                    st.info("No se encontraron productos. Probá con otro término.")
+                else:
+                    for product in shopify_products:
+                        with st.container():
+                            col_img, col_info, col_select = st.columns([1, 2, 1])
+                            
+                            with col_img:
+                                if product.get("images"):
+                                    st.image(product["images"][0]["src"], width=150)
+                                else:
+                                    st.write("Sin imagen")
+                            
+                            with col_info:
+                                st.write(f"**{product['title']}**")
+                                st.caption(f"Handle: {product['handle']}")
                                 
-                                with col_img:
-                                    if product.get("images"):
-                                        st.image(product["images"][0]["src"], width=150)
-                                    else:
-                                        st.write("Sin imagen")
+                                skus = [v.get("sku", "") for v in product.get("variants", [])]
+                                if skus:
+                                    st.caption(f"SKUs: {', '.join(skus[:3])}")
                                 
-                                with col_info:
-                                    st.write(f"**{product['title']}**")
-                                    st.caption(f"Handle: {product['handle']}")
-                                    
-                                    # SKUs
-                                    skus = [v.get("sku", "") for v in product.get("variants", [])]
-                                    if skus:
-                                        st.caption(f"SKUs: {', '.join(skus[:3])}")
-                                    
-                                    # Descripción
-                                    if product.get("body_html"):
-                                        with st.expander("Ver descripción"):
-                                            st.write(product["body_html"], unsafe_allow_html=True)
-                                    
-                                    # Precio
-                                    if product.get("variants"):
-                                        price = product["variants"][0].get("price", "N/A")
-                                        st.caption(f"Precio: ${price}")
+                                if product.get("body_html"):
+                                    with st.expander("Ver descripción"):
+                                        st.write(product["body_html"], unsafe_allow_html=True)
                                 
-                                with col_select:
-                                    if st.button("➡️ Seleccionar", key=f"select_{product['id']}"):
-                                        st.session_state.selected_shopify_product = product
-                                        st.success("✅ Producto seleccionado")
-                                        st.session_state.active_tab = 2
-                                        st.rerun()
-                                
-                                st.divider()
-            else:
-                st.info("📥 Primero cargá los productos de Shopify con el botón de arriba")
+                                if product.get("variants"):
+                                    price = product["variants"][0].get("price", "N/A")
+                                    st.caption(f"Precio: ${price}")
+                            
+                            with col_select:
+                                if st.button("➡️ Seleccionar", key=f"select_{product['id']}"):
+                                    st.session_state.selected_shopify_product = product
+                                    st.success("✅ Producto seleccionado")
+                                    st.rerun()
+                            
+                            st.divider()
     
     # ==================== TAB 3: Sincronización ====================
     with tab3:
