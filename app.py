@@ -2,6 +2,7 @@ import urllib.parse
 import streamlit as st
 import requests
 import json
+import time
 from PIL import Image
 from io import BytesIO
 import base64
@@ -15,33 +16,23 @@ st.set_page_config(
 
 # URLs
 BSALE_API_URL = "https://api.bsale.io/v1"
-SHOPIFY_API_VERSION = "2024-01"
+SHOPIFY_API_VERSION = "2024-07"
 
 def get_bsale_headers():
-    """Obtener headers de Bsale desde session_state (actualizados)"""
     token = st.session_state.get("bsale_token", "")
-    return {
-        "access_token": token,
-        "Content-Type": "application/json"
-    }
+    return {"access_token": token, "Content-Type": "application/json"}
 
 def get_shopify_headers():
-    """Obtener headers de Shopify desde session_state (actualizados)"""
     token = st.session_state.get("shopify_token", "")
-    return {
-        "X-Shopify-Access-Token": token,
-        "Content-Type": "application/json"
-    }
+    return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
 def get_shopify_url():
-    """Obtener URL de Shopify desde session_state"""
     shop = st.session_state.get("shopify_shop", "morekashop1")
     return f"https://{shop}.myshopify.com/admin/api/{SHOPIFY_API_VERSION}"
 
 # ==================== FUNCIONES Bsale ====================
 
 def get_bsale_products(limit=100, offset=0):
-    """Obtener productos de Bsale"""
     url = f"{BSALE_API_URL}/products.json?limit={limit}&offset={offset}&expand=[variants,product_type]"
     response = requests.get(url, headers=get_bsale_headers())
     if response.status_code == 200:
@@ -51,7 +42,6 @@ def get_bsale_products(limit=100, offset=0):
     return []
 
 def get_bsale_variants(product_id):
-    """Obtener variantes de un producto Bsale"""
     url = f"{BSALE_API_URL}/products/{product_id}/variants.json"
     response = requests.get(url, headers=get_bsale_headers())
     if response.status_code == 200:
@@ -59,7 +49,6 @@ def get_bsale_variants(product_id):
     return []
 
 def get_bsale_variant_detail(variant_id):
-    """Obtener detalle de una variante Bsale"""
     url = f"{BSALE_API_URL}/variants/{variant_id}.json"
     response = requests.get(url, headers=get_bsale_headers())
     if response.status_code == 200:
@@ -67,7 +56,6 @@ def get_bsale_variant_detail(variant_id):
     return {}
 
 def update_bsale_variant_web(variant_id, web_name, web_description, web_active=True):
-    """Actualizar campos web de una variante Bsale"""
     url = f"{BSALE_API_URL}/variants/{variant_id}.json"
     data = {
         "webName": web_name,
@@ -78,7 +66,6 @@ def update_bsale_variant_web(variant_id, web_name, web_description, web_active=T
     return response.status_code == 200, response.json() if response.status_code == 200 else response.text
 
 def upload_bsale_image_to_variant(variant_id, image_url):
-    """Subir imagen a una variante Bsale desde URL"""
     try:
         img_response = requests.get(image_url, timeout=15)
         if img_response.status_code != 200:
@@ -97,14 +84,11 @@ def upload_bsale_image_to_variant(variant_id, image_url):
         return False, str(e)
 
 def get_product_with_web_status(product):
-    """Obtener producto con estado web agregado"""
     product_id = product["id"]
     product_name = product.get("name", "Sin nombre")
     
-    # Obtener variantes
     variants = get_bsale_variants(product_id)
     
-    # Verificar estado web de cada variante
     variants_web = []
     has_any_web_desc = False
     all_have_web_desc = True
@@ -153,52 +137,83 @@ def get_product_with_web_status(product):
 
 # ==================== FUNCIONES Shopify ====================
 
-def search_shopify_products(query, limit=50):
-    """Buscar productos en Shopify - con URL encoding y mejor manejo de errores"""
-    if not st.session_state.get("shopify_token"):
-        st.error("❌ No hay token de Shopify configurado. Guardá la configuración en el sidebar primero.")
-        return []
+@st.cache_data(ttl=600)
+def fetch_all_shopify_products():
+    """Cargar todos los productos de Shopify (con paginación)"""
+    products = []
+    url = f"{get_shopify_url()}/products.json?limit=250"
     
-    # URL encode the query
-    encoded_query = urllib.parse.quote(query)
+    progress = st.empty()
+    page = 1
     
-    # Build URL with parameters
-    params = {
-        "title": encoded_query,
-        "limit": limit,
-        "fields": "id,title,handle,body_html,images,tags,variants"
-    }
-    
-    url = f"{get_shopify_url()}/products.json"
-    
-    try:
-        response = requests.get(url, headers=get_shopify_headers(), params=params, timeout=15)
-        
-        st.write(f"Debug - URL: {response.url}")
-        st.write(f"Debug - Status: {response.status_code}")
-        
-        if response.status_code == 200:
+    while url:
+        progress.write(f"📥 Cargando página {page}...")
+        try:
+            response = requests.get(url, headers=get_shopify_headers(), timeout=30)
+            
+            if response.status_code != 200:
+                st.error(f"Error Shopify: {response.status_code} - {response.text[:300]}")
+                break
+            
             data = response.json()
-            products = data.get("products", [])
-            st.write(f"Debug - Products found: {len(products)}")
-            return products
-        elif response.status_code == 401:
-            st.error("❌ Error 401: Token de Shopify inválido. Verificá el Access Token en el sidebar.")
-        elif response.status_code == 404:
-            st.error("❌ Error 404: Shop no encontrado. Verificá el nombre de la tienda.")
-        else:
-            st.error(f"❌ Error Shopify: {response.status_code} - {response.text[:300]}")
-    except requests.exceptions.Timeout:
-        st.error("❌ Timeout: La petición a Shopify tardó demasiado.")
-    except requests.exceptions.ConnectionError:
-        st.error("❌ Error de conexión: No se pudo conectar con Shopify.")
-    except Exception as e:
-        st.error(f"❌ Error inesperado: {str(e)}")
+            page_products = data.get("products", [])
+            products.extend(page_products)
+            
+            # Verificar link header para paginación
+            link_header = response.headers.get("Link", "")
+            next_url = None
+            
+            if 'rel="next"' in link_header:
+                for link in link_header.split(","):
+                    if 'rel="next"' in link:
+                        next_url = link.split(";")[0].strip().strip("<>").strip('"')
+                        break
+            
+            url = next_url
+            page += 1
+            
+            if not url:
+                break
+                
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+            break
     
-    return []
+    progress.empty()
+    return products
+
+def filter_shopify_products(products, query):
+    """Filtrar productos por nombre o SKU (búsqueda local)"""
+    query_lower = query.lower().strip()
+    results = []
+    
+    for product in products:
+        # Buscar en título
+        if query_lower in product.get("title", "").lower():
+            results.append(product)
+            continue
+        
+        # Buscar en handle
+        if query_lower in product.get("handle", "").lower():
+            results.append(product)
+            continue
+        
+        # Buscar en SKU de variantes
+        for variant in product.get("variants", []):
+            sku = variant.get("sku", "")
+            if sku and query_lower in sku.lower():
+                results.append(product)
+                break
+        
+        # Buscar en tags
+        for tag in product.get("tags", []):
+            if query_lower in tag.lower():
+                results.append(product)
+                break
+    
+    return results
 
 def get_shopify_product(product_id):
-    """Obtener producto específico de Shopify"""
     url = f"{get_shopify_url()}/products/{product_id}.json"
     response = requests.get(url, headers=get_shopify_headers())
     if response.status_code == 200:
@@ -215,30 +230,16 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuración")
         
-        # Obtener defaults desde secrets o session_state
         default_bsale_token = st.session_state.get("bsale_token", st.secrets.get("bsale", {}).get("access_token", ""))
         default_shopify_token = st.session_state.get("shopify_token", st.secrets.get("shopify", {}).get("MOREKA_ACCESS_TOKEN", ""))
         default_shopify_shop = st.session_state.get("shopify_shop", st.secrets.get("shopify", {}).get("shop_name", "morekashop1"))
         
-        # Bsale
         st.subheader("Bsale")
-        bsale_token = st.text_input(
-            "Access Token Bsale",
-            value=default_bsale_token,
-            type="password"
-        )
+        bsale_token = st.text_input("Access Token Bsale", value=default_bsale_token, type="password")
         
-        # Shopify
         st.subheader("Shopify")
-        shopify_token = st.text_input(
-            "Access Token Shopify",
-            value=default_shopify_token,
-            type="password"
-        )
-        shopify_shop = st.text_input(
-            "Shop Name",
-            value=default_shopify_shop
-        )
+        shopify_token = st.text_input("Access Token Shopify", value=default_shopify_token, type="password")
+        shopify_shop = st.text_input("Shop Name", value=default_shopify_shop)
         
         if st.button("💾 Guardar Configuración"):
             st.session_state.bsale_token = bsale_token
@@ -247,7 +248,6 @@ def main():
             st.success("✅ Configuración guardada")
             st.rerun()
     
-    # Verificar credenciales
     bsale_token = st.session_state.get("bsale_token", "")
     shopify_token = st.session_state.get("shopify_token", "")
     
@@ -255,10 +255,9 @@ def main():
         st.warning("⚠️ Configura el Access Token de Bsale en el sidebar y guardá")
         return
     
-    # Tabs
     tab1, tab2, tab3 = st.tabs(["📦 Productos Bsale", "🔍 Buscar en Shopify", "🔄 Sincronizar"])
     
-    # ==================== TAB 1: Productos Bsale (por producto) ====================
+    # ==================== TAB 1: Productos Bsale ====================
     with tab1:
         st.header("📦 Productos Bsale - Estado Web")
         
@@ -285,11 +284,9 @@ def main():
                 st.session_state.bsale_products = enriched_products
                 st.success(f"✅ {len(enriched_products)} productos cargados")
         
-        # Mostrar productos
         if "bsale_products" in st.session_state:
             products = st.session_state.bsale_products
             
-            # Aplicar filtros
             filtered = products
             if search_bsale:
                 filtered = [p for p in filtered if search_bsale.lower() in p["name"].lower()]
@@ -307,11 +304,9 @@ def main():
             
             for product in filtered:
                 with st.container():
-                    # Card de producto
                     col_main, col_action = st.columns([4, 1])
                     
                     with col_main:
-                        # Estado visual
                         if product["all_have_web_description"]:
                             st.success(f"✅ **{product['name']}**")
                         elif product["has_any_web_description"]:
@@ -321,7 +316,6 @@ def main():
                         
                         st.caption(f"Tipo: {product['product_type']} | Variantes: {product['variants_count']}")
                         
-                        # Expandir para ver variantes
                         with st.expander(f"Ver {product['variants_count']} variantes"):
                             for variant in product["variants"]:
                                 cols = st.columns([1, 1, 1, 1])
@@ -352,7 +346,7 @@ def main():
                             if st.button("🔍 Buscar en Shopify", key=f"search_{product['id']}"):
                                 st.session_state.selected_bsale_product = product
                                 st.session_state.shopify_search_query = product["name"]
-                                st.session_state.active_tab = 1  # Ir a tab 2
+                                st.session_state.active_tab = 1
                                 st.rerun()
                         else:
                             st.info("✅ Completo")
@@ -366,68 +360,76 @@ def main():
         if not shopify_token:
             st.warning("⚠️ Configura el Access Token de Shopify en el sidebar y guardá")
         else:
-            # Mostrar token status
-            st.info(f"Shopify configurado: Shop={st.session_state.get('shopify_shop', 'morekashop1')}")
+            st.info(f"Shopify: {st.session_state.get('shopify_shop', 'morekashop1')}")
             
-            search_query = st.text_input(
-                "Buscar producto en Shopify",
-                value=st.session_state.get("shopify_search_query", ""),
-                key="shopify_search_input"
-            )
+            # Cargar productos de Shopify
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                if st.button("📥 Cargar Todos los Productos Shopify"):
+                    with st.spinner("Cargando productos de Shopify (puede tardar)..."):
+                        shopify_products = fetch_all_shopify_products()
+                        st.session_state.all_shopify_products = shopify_products
+                        st.success(f"✅ {len(shopify_products)} productos cargados")
             
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                search_clicked = st.button("🔍 Buscar en Shopify")
-            
-            if search_clicked and search_query:
-                with st.spinner("Buscando..."):
-                    shopify_products = search_shopify_products(search_query)
-                    st.session_state.shopify_results = shopify_products
-            
-            if "shopify_results" in st.session_state:
-                shopify_products = st.session_state.shopify_results
+            # Buscar entre los productos cargados
+            if "all_shopify_products" in st.session_state:
+                all_products = st.session_state.all_shopify_products
                 
-                if not shopify_products:
-                    st.info("No se encontraron productos. Probá con otro término.")
-                else:
-                    st.success(f"✅ {len(shopify_products)} productos encontrados")
+                st.write(f"📦 **{len(all_products)}** productos en memoria")
+                
+                search_query = st.text_input(
+                    "🔍 Buscar por nombre o SKU",
+                    value=st.session_state.get("shopify_search_query", ""),
+                    placeholder="Ej: iPhone, Cable, Funda...",
+                    key="shopify_search_input"
+                )
+                
+                if search_query:
+                    filtered = filter_shopify_products(all_products, search_query)
+                    st.write(f"**{len(filtered)}** resultados para '{search_query}'")
                     
-                    for product in shopify_products:
-                        with st.container():
-                            col_img, col_info, col_select = st.columns([1, 2, 1])
-                            
-                            with col_img:
-                                if product.get("images"):
-                                    st.image(product["images"][0]["src"], width=150)
-                                else:
-                                    st.write("Sin imagen")
-                            
-                            with col_info:
-                                st.write(f"**{product['title']}**")
-                                st.caption(f"Handle: {product['handle']}")
+                    if not filtered:
+                        st.info("No se encontraron productos. Probá con otro término.")
+                    else:
+                        for product in filtered:
+                            with st.container():
+                                col_img, col_info, col_select = st.columns([1, 2, 1])
                                 
-                                # Descripción
-                                if product.get("body_html"):
-                                    with st.expander("Ver descripción"):
-                                        st.write(product["body_html"], unsafe_allow_html=True)
-                                else:
-                                    st.caption("Sin descripción")
+                                with col_img:
+                                    if product.get("images"):
+                                        st.image(product["images"][0]["src"], width=150)
+                                    else:
+                                        st.write("Sin imagen")
                                 
-                                # Variantes
-                                if product.get("variants"):
-                                    st.caption(f"Variantes: {len(product['variants'])} | Precio: ${product['variants'][0].get('price', 'N/A')}")
+                                with col_info:
+                                    st.write(f"**{product['title']}**")
+                                    st.caption(f"Handle: {product['handle']}")
+                                    
+                                    # SKUs
+                                    skus = [v.get("sku", "") for v in product.get("variants", [])]
+                                    if skus:
+                                        st.caption(f"SKUs: {', '.join(skus[:3])}")
+                                    
+                                    # Descripción
+                                    if product.get("body_html"):
+                                        with st.expander("Ver descripción"):
+                                            st.write(product["body_html"], unsafe_allow_html=True)
+                                    
+                                    # Precio
+                                    if product.get("variants"):
+                                        price = product["variants"][0].get("price", "N/A")
+                                        st.caption(f"Precio: ${price}")
                                 
-                                if product.get("tags"):
-                                    st.caption(f"Tags: {', '.join(product['tags'][:3])}")
-                            
-                            with col_select:
-                                if st.button("➡️ Seleccionar", key=f"select_{product['id']}"):
-                                    st.session_state.selected_shopify_product = product
-                                    st.success("✅ Producto seleccionado")
-                                    st.session_state.active_tab = 2  # Ir a tab 3
-                                    st.rerun()
-                            
-                            st.divider()
+                                with col_select:
+                                    if st.button("➡️ Seleccionar", key=f"select_{product['id']}"):
+                                        st.session_state.selected_shopify_product = product
+                                        st.success("✅ Producto seleccionado")
+                                        st.session_state.active_tab = 2
+                                        st.rerun()
+                                
+                                st.divider()
+            else:
+                st.info("📥 Primero cargá los productos de Shopify con el botón de arriba")
     
     # ==================== TAB 3: Sincronización ====================
     with tab3:
@@ -449,7 +451,6 @@ def main():
                 
                 st.caption(f"Tipo: {bp['product_type']} | Variantes: {bp['variants_count']}")
                 
-                # Mostrar variantes y cuáles faltan
                 st.write("**Variantes:**")
                 for variant in bp["variants"]:
                     status = "✅" if variant["has_web_description"] else "❌"
