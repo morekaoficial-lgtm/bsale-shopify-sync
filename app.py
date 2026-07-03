@@ -1,3 +1,4 @@
+import urllib.parse
 import streamlit as st
 import requests
 import json
@@ -153,13 +154,47 @@ def get_product_with_web_status(product):
 # ==================== FUNCIONES Shopify ====================
 
 def search_shopify_products(query, limit=50):
-    """Buscar productos en Shopify"""
-    url = f"{get_shopify_url()}/products.json?title={query}&limit={limit}"
-    response = requests.get(url, headers=get_shopify_headers())
-    if response.status_code == 200:
-        return response.json().get("products", [])
-    else:
-        st.error(f"Error Shopify: {response.status_code} - {response.text[:300]}")
+    """Buscar productos en Shopify - con URL encoding y mejor manejo de errores"""
+    if not st.session_state.get("shopify_token"):
+        st.error("❌ No hay token de Shopify configurado. Guardá la configuración en el sidebar primero.")
+        return []
+    
+    # URL encode the query
+    encoded_query = urllib.parse.quote(query)
+    
+    # Build URL with parameters
+    params = {
+        "title": encoded_query,
+        "limit": limit,
+        "fields": "id,title,handle,body_html,images,tags,variants"
+    }
+    
+    url = f"{get_shopify_url()}/products.json"
+    
+    try:
+        response = requests.get(url, headers=get_shopify_headers(), params=params, timeout=15)
+        
+        st.write(f"Debug - URL: {response.url}")
+        st.write(f"Debug - Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            products = data.get("products", [])
+            st.write(f"Debug - Products found: {len(products)}")
+            return products
+        elif response.status_code == 401:
+            st.error("❌ Error 401: Token de Shopify inválido. Verificá el Access Token en el sidebar.")
+        elif response.status_code == 404:
+            st.error("❌ Error 404: Shop no encontrado. Verificá el nombre de la tienda.")
+        else:
+            st.error(f"❌ Error Shopify: {response.status_code} - {response.text[:300]}")
+    except requests.exceptions.Timeout:
+        st.error("❌ Timeout: La petición a Shopify tardó demasiado.")
+    except requests.exceptions.ConnectionError:
+        st.error("❌ Error de conexión: No se pudo conectar con Shopify.")
+    except Exception as e:
+        st.error(f"❌ Error inesperado: {str(e)}")
+    
     return []
 
 def get_shopify_product(product_id):
@@ -180,11 +215,16 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuración")
         
+        # Obtener defaults desde secrets o session_state
+        default_bsale_token = st.session_state.get("bsale_token", st.secrets.get("bsale", {}).get("access_token", ""))
+        default_shopify_token = st.session_state.get("shopify_token", st.secrets.get("shopify", {}).get("MOREKA_ACCESS_TOKEN", ""))
+        default_shopify_shop = st.session_state.get("shopify_shop", st.secrets.get("shopify", {}).get("shop_name", "morekashop1"))
+        
         # Bsale
         st.subheader("Bsale")
         bsale_token = st.text_input(
             "Access Token Bsale",
-            value=st.session_state.get("bsale_token", st.secrets.get("bsale", {}).get("access_token", "")),
+            value=default_bsale_token,
             type="password"
         )
         
@@ -192,12 +232,12 @@ def main():
         st.subheader("Shopify")
         shopify_token = st.text_input(
             "Access Token Shopify",
-            value=st.session_state.get("shopify_token", st.secrets.get("shopify", {}).get("MOREKA_ACCESS_TOKEN", "")),
+            value=default_shopify_token,
             type="password"
         )
         shopify_shop = st.text_input(
             "Shop Name",
-            value=st.session_state.get("shopify_shop", st.secrets.get("shopify", {}).get("shop_name", "morekashop1"))
+            value=default_shopify_shop
         )
         
         if st.button("💾 Guardar Configuración"):
@@ -212,7 +252,7 @@ def main():
     shopify_token = st.session_state.get("shopify_token", "")
     
     if not bsale_token:
-        st.warning("⚠️ Configura el Access Token de Bsale en el sidebar")
+        st.warning("⚠️ Configura el Access Token de Bsale en el sidebar y guardá")
         return
     
     # Tabs
@@ -324,8 +364,11 @@ def main():
         st.header("🔍 Buscar Productos en Shopify")
         
         if not shopify_token:
-            st.warning("⚠️ Configura el Access Token de Shopify en el sidebar")
+            st.warning("⚠️ Configura el Access Token de Shopify en el sidebar y guardá")
         else:
+            # Mostrar token status
+            st.info(f"Shopify configurado: Shop={st.session_state.get('shopify_shop', 'morekashop1')}")
+            
             search_query = st.text_input(
                 "Buscar producto en Shopify",
                 value=st.session_state.get("shopify_search_query", ""),
@@ -334,10 +377,12 @@ def main():
             
             col1, col2 = st.columns([1, 3])
             with col1:
-                if st.button("🔍 Buscar en Shopify") and search_query:
-                    with st.spinner("Buscando..."):
-                        shopify_products = search_shopify_products(search_query)
-                        st.session_state.shopify_results = shopify_products
+                search_clicked = st.button("🔍 Buscar en Shopify")
+            
+            if search_clicked and search_query:
+                with st.spinner("Buscando..."):
+                    shopify_products = search_shopify_products(search_query)
+                    st.session_state.shopify_results = shopify_products
             
             if "shopify_results" in st.session_state:
                 shopify_products = st.session_state.shopify_results
